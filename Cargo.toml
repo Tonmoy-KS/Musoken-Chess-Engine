@@ -1,0 +1,17 @@
+[package]
+name = "musoken"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chess = "3.2" # For chess board and move generation
+rand = "0.8"  # For random move selection and genetic algorithm
+dashmap = "6.0" # For thread-safe transposition table
+rayon = "1.8" # For parallelization
+log = "0.4"   # For logging
+env_logger = "0.10" # For logging configuration
+rusqlite = { version = "0.29", features = ["bundled"] } # For game database
+serde = { version = "1.0", features = ["derive"] } # For serialization (opening book, NNUE weights)
+serde_json = "1.0" # For JSON serialization
+tch = "0.14"  # For PyTorch-like NNUE implementation
+anyhow = "1.0" # For error handling
