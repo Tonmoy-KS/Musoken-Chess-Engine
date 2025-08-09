@@ -1,4 +1,7 @@
-[\Planning Start]
+for those who are new: PUP stands for "Public Update Planning".
+
+
+[\Planning Start/]
 
 current underdevelopment engine: Musōken. 
 I am focusing in to make it a fully self-improving engine, my core(and maybe too ambitious) goal is that it can write/edit it's own code for mid-game adaptation. This goal, even though ambitious, will may make it stronger than Lc0 or AlphaZero. Rust provides C++-level speed without the common memory-related bugs, making it an ideal language for a complex, concurrent application like a chess engine, making it perfect for engines like this. 
