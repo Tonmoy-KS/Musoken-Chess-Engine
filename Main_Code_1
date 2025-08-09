@@ -1,299 +1,1098 @@
 // musoken_engine.rs
-// Musōken – V.1.2.1 – The Peerless Chess Engine 
+// Musōken – V.1.2.0 – The Peerless Chess Engine 
 
-use chess::{Board, ChessMove, Color, Game, GameResult, MoveGen, Piece, Rank, Square};
-use rand::prelude::*;
+// Core chess logic
+use chess::{Board, ChessMove, Color, Piece, Square, MoveGen, GameResult, ALL_SQUARES};
+// Parallel processing
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::io;
+// Concurrent hash map for transposition table
+use dashmap::DashMap;
+// Atomic operations for thread-safe counters
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicI32, Ordering};
+// Time handling
+use std::time::{Instant, Duration};
+// Thread synchronization primitives
 use std::sync::{Arc, Mutex};
-use std::thread;
+// Data structures
+use std::collections::{VecDeque, HashMap};
+// File I/O for saving/loading learned data
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write, BufRead, Result as IoResult};
+// Random number generation for genetic algorithms
+use rand::prelude::*;
+// Serialization for saving/loading parameters
+use serde::{Serialize, Deserialize};
 
-// --- Constants ---
-const MATE_SCORE: i32 = 1_000_000;
+//- Constants -
+const INFINITY: i32 = 999_999;
+const MATE_VALUE: i32 = 900_000;
+const TT_SIZE: usize = 1 << 20; // 1M entries
+
+// Default piece values
+const DEFAULT_PIECE_VALUES: [i32; 7] = [0, 100, 320, 330, 500, 900, 20000]; // P, N, B, R, Q, K
+
+//- Piece-Square Tables
+const DEFAULT_PAWN_PST: [i32; 64] = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0
+];
+
+const DEFAULT_KNIGHT_PST: [i32; 64] = [
+   -50,-40,-30,-30,-30,-30,-40,-50,
+   -40,-20,  0,  0,  0,  0,-20,-40,
+   -30,  0, 10, 15, 15, 10,  0,-30,
+   -30,  5, 15, 20, 20, 15,  5,-30,
+   -30,  0, 15, 20, 20, 15,  0,-30,
+   -30,  5, 10, 15, 15, 10,  5,-30,
+   -40,-20,  0,  5,  5,  0,-20,-40,
+   -50,-40,-30,-30,-30,-30,-40,-50
+];
+
+const DEFAULT_BISHOP_PST: [i32; 64] = [
+   -20,-10,-10,-10,-10,-10,-10,-20,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -10,  0,  5, 10, 10,  5,  0,-10,
+   -10,  5,  5, 10, 10,  5,  5,-10,
+   -10,  0, 10, 10, 10, 10,  0,-10,
+   -10, 10, 10, 10, 10, 10, 10,-10,
+   -10,  5,  0,  0,  0,  0,  5,-10,
+   -20,-10,-10,-10,-10,-10,-10,-20
+];
+
+const DEFAULT_ROOK_PST: [i32; 64] = [
+    0,  0,  0,  0,  0,  0,  0,  0,
+    5, 10, 10, 10, 10, 10, 10,  5,
+   -5,  0,  0,  0,  0,  0,  0, -5,
+   -5,  0,  0,  0,  0,  0,  0, -5,
+   -5,  0,  0,  0,  0,  0,  0, -5,
+   -5,  0,  0,  0,  0,  0,  0, -5,
+   -5,  0,  0,  0,  0,  0,  0, -5,
+    0,  0,  0,  5,  5,  0,  0,  0
+];
+
+const DEFAULT_QUEEN_PST: [i32; 64] = [
+   -20,-10,-10, -5, -5,-10,-10,-20,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -10,  0,  5,  5,  5,  5,  0,-10,
+    -5,  0,  5,  5,  5,  5,  0, -5,
+     0,  0,  5,  5,  5,  5,  0, -5,
+   -10,  5,  5,  5,  5,  5,  0,-10,
+   -10,  0,  5,  0,  0,  0,  0,-10,
+   -20,-10,-10, -5, -5,-10,-10,-20
+];
+
+const DEFAULT_KING_MIDDLE_PST: [i32; 64] = [
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -20,-30,-30,-40,-40,-30,-30,-20,
+   -10,-20,-20,-20,-20,-20,-20,-10,
+    20, 20,  0,  0,  0,  0, 20, 20,
+    20, 30, 10,  0,  0, 10, 30, 20
+];
+
+const DEFAULT_KING_END_PST: [i32; 64] = [
+   -50,-40,-30,-20,-20,-30,-40,-50,
+   -30,-20,-10,  0,  0,-10,-20,-30,
+   -30,-10, 20, 30, 30, 20,-10,-30,
+   -30,-10, 30, 40, 40, 30,-10,-30,
+   -30,-10, 30, 40, 40, 30,-10,-30,
+   -30,-10, 20, 30, 30, 20,-10,-30,
+   -30,-30,  0,  0,  0,  0,-30,-30,
+   -50,-30,-30,-30,-30,-30,-30,-50
+];
+
+// Genetic Algorithm parameters
 const POPULATION_SIZE: usize = 50;
 const GENERATIONS: usize = 20;
 const MUTATION_RATE: f64 = 0.1;
 const TOURNAMENT_SIZE: usize = 5;
 
-// --- Evaluation Logic (The "Genome") ---
+//- Core Engine Structure -
+pub struct Musoken {
+    // Evaluation parameters (tunable by GA)
+    eval_params: Arc<Mutex<EvalParams>>,
+    
+    // Shared transposition table
+    tt: Arc<DashMap<u64, TTEntry>>,
+    
+    // Killer moves for move ordering [ply][slot]
+    killer_moves: Box<[[Option<ChessMove>; 2]; 64]>,
+    
+    // History heuristic for move ordering [from][to]
+    history: Box<[[i32; 64]; 64]>,
+    
+    // Search statistics
+    nodes_searched: AtomicU64,
+    stop_search: AtomicBool,
+    
+    // Search parameters
+    max_depth: usize,
+    time_limit: Option<Duration>,
+    
+    // For aspiration windows
+    prev_score: AtomicI32,
+    
+    // Self-learning module
+    learning_module: LearningModule,
+}
 
-/// The "Genome" of the Musoken engine. All tunable parameters are stored here.
-/// This struct is what will be evolved by the genetic algorithm.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvalParams {
-    pub piece_values: [i32; 7], // P, N, B, R, Q, K (EMPTY is 0)
-    pub pawn_pst: [i32; 64],
-    pub mobility_bonus: i32,
+//- Evaluation Parameters (Tunable by GA) -
+#[derive(Clone, Serialize, Deserialize)]
+struct EvalParams {
+    piece_values: [i32; 7],
+    pawn_pst: [i32; 64],
+    knight_pst: [i32; 64],
+    bishop_pst: [i32; 64],
+    rook_pst: [i32; 64],
+    queen_pst: [i32; 64],
+    king_middle_pst: [i32; 64],
+    king_end_pst: [i32; 64],
+    // Additional tunable parameters
+    mobility_bonus: i32,
+    king_safety_bonus: i32,
+    pawn_structure_bonus: i32,
 }
 
 impl Default for EvalParams {
-    /// Provides a baseline set of parameters to start from.
     fn default() -> Self {
-        Self {
-            piece_values: [0, 100, 320, 330, 500, 900, 20000],
-            pawn_pst: [
-                 0,  0,  0,  0,  0,  0,  0,  0,
-                 5, 10, 10,-20,-20, 10, 10,  5,
-                 5, -5,-10,  0,  0,-10, -5,  5,
-                 0,  0,  0, 20, 20,  0,  0,  0,
-                 5,  5, 10, 25, 25, 10,  5,  5,
-                10, 10, 20, 30, 30, 20, 10, 10,
-                50, 50, 50, 50, 50, 50, 50, 50,
-                 0,  0,  0,  0,  0,  0,  0,  0,
-            ],
+        EvalParams {
+            piece_values: DEFAULT_PIECE_VALUES,
+            pawn_pst: DEFAULT_PAWN_PST,
+            knight_pst: DEFAULT_KNIGHT_PST,
+            bishop_pst: DEFAULT_BISHOP_PST,
+            rook_pst: DEFAULT_ROOK_PST,
+            queen_pst: DEFAULT_QUEEN_PST,
+            king_middle_pst: DEFAULT_KING_MIDDLE_PST,
+            king_end_pst: DEFAULT_KING_END_PST,
             mobility_bonus: 1,
+            king_safety_bonus: 5,
+            pawn_structure_bonus: 2,
         }
     }
 }
 
-/// The core evaluation function. It takes `params` as an argument, allowing any "genome"
-/// to be evaluated without changing the core logic. This is key to testing mutated children.
-pub fn evaluate(board: &Board, params: &EvalParams) -> i32 {
-    let mut score = 0;
-    let my_color = board.side_to_move();
+//- Transposition Table Entry -
+#[derive(Clone)]
+struct TTEntry {
+    key: u64,       // Full hash key for collision detection
+    score: i32,     // Score from search
+    best_move: Option<ChessMove>, // Best move found
+    depth: u8,      // Depth searched
+    flag: u8,       // 0: exact, 1: lower bound, 2: upper bound
+    age: u8,        // For TT replacement strategy
+}
 
-    for square in chess::ALL_SQUARES {
-        if let Some(piece) = board.piece_on(square) {
-            let piece_val = params.piece_values[piece.0 as usize];
-            let pst_val = get_pst_value(piece, square, params);
+impl TTEntry {
+    fn new(key: u64, score: i32, best_move: Option<ChessMove>, depth: u8, flag: u8, age: u8) -> Self {
+        TTEntry { key, score, best_move, depth, flag, age }
+    }
+}
 
-            if piece.1 == my_color {
-                score += piece_val + pst_val;
-            } else {
-                score -= piece_val + pst_val;
+//- Self-Learning Module -
+struct LearningModule {
+    // Game database for self-play and analysis
+    game_db: Arc<Mutex<Vec<GameResult>>>,
+    // Opening book learned from games
+    opening_book: Arc<Mutex<HashMap<String, OpeningBookEntry>>>,
+    // Evaluation data for GA tuning
+    eval_training_data: Arc<Mutex<Vec<(String, i32)>>>, // (FEN, result_score)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GameResult {
+    moves: Vec<String>, // UCI moves
+    result: String,     // "1-0", "0-1", "1/2-1/2"
+    fen: String,        // Starting FEN
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct OpeningBookEntry {
+    weight: f64,
+    count: usize,
+    wins: usize,
+    losses: usize,
+    draws: usize,
+}
+
+impl Default for OpeningBookEntry {
+    fn default() -> Self {
+        OpeningBookEntry {
+            weight: 1.0,
+            count: 0,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+        }
+    }
+}
+
+impl LearningModule {
+    fn new() -> Self {
+        LearningModule {
+            game_db: Arc::new(Mutex::new(Vec::new())),
+            opening_book: Arc::new(Mutex::new(HashMap::new())),
+            eval_training_data: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn add_game(&self, game: GameResult) {
+        if let Ok(mut db) = self.game_db.lock() {
+            db.push(game);
+        }
+    }
+
+    fn add_training_data(&self, fen: String, result: i32) {
+        if let Ok(mut data) = self.eval_training_data.lock() {
+            data.push((fen, result));
+        }
+    }
+
+    fn save_to_file(&self, filename: &str) -> IoResult<()> {
+        let file = File::create(filename)?;
+        let writer = BufWriter::new(file);
+        if let Ok(db) = self.game_db.lock() {
+            serde_json::to_writer(writer, &*db)?;
+        }
+        Ok(())
+    }
+
+    fn load_from_file(&self, filename: &str) -> IoResult<()> {
+        let file = File::open(filename)?;
+        let reader = BufReader::new(file);
+        let games: Vec<GameResult> = serde_json::from_reader(reader)?;
+        if let Ok(mut db) = self.game_db.lock() {
+            *db = games;
+        }
+        Ok(())
+    }
+}
+
+//- Genetic Algorithm Individual -
+#[derive(Clone)]
+struct GAIndividual {
+    params: EvalParams,
+    fitness: f64,
+}
+
+impl GAIndividual {
+    fn new(params: EvalParams) -> Self {
+        GAIndividual {
+            params,
+            fitness: 0.0,
+        }
+    }
+    
+    fn random(rng: &mut ThreadRng) -> Self {
+        let mut params = EvalParams::default();
+        
+        // Mutate piece values slightly
+        for i in 1..7 { // Skip Empty piece
+            let delta = rng.gen_range(-20..=20);
+            params.piece_values[i] = (params.piece_values[i] as i32 + delta).max(50).min(2000);
+        }
+        
+        // Mutate PSTs slightly
+        mutate_pst(&mut params.pawn_pst, rng);
+        mutate_pst(&mut params.knight_pst, rng);
+        mutate_pst(&mut params.bishop_pst, rng);
+        mutate_pst(&mut params.rook_pst, rng);
+        mutate_pst(&mut params.queen_pst, rng);
+        mutate_pst(&mut params.king_middle_pst, rng);
+        mutate_pst(&mut params.king_end_pst, rng);
+        
+        // Mutate other parameters
+        params.mobility_bonus = (params.mobility_bonus + rng.gen_range(-1..=1)).max(0).min(5);
+        params.king_safety_bonus = (params.king_safety_bonus + rng.gen_range(-2..=2)).max(1).min(20);
+        params.pawn_structure_bonus = (params.pawn_structure_bonus + rng.gen_range(-1..=1)).max(0).min(10);
+        
+        GAIndividual::new(params)
+    }
+}
+
+fn mutate_pst(pst: &mut [i32; 64], rng: &mut ThreadRng) {
+    for i in 0..64 {
+        if rng.gen::<f64>() < MUTATION_RATE {
+            let delta = rng.gen_range(-5..=5);
+            pst[i] = (pst[i] + delta).max(-100).min(100);
+        }
+    }
+}
+
+//- Musoken Implementation -
+impl Musoken {
+    pub fn new() -> Self {
+        Musoken {
+            eval_params: Arc::new(Mutex::new(EvalParams::default())),
+            tt: Arc::new(DashMap::new()),
+            killer_moves: Box::new([[None; 2]; 64]),
+            history: Box::new([[0; 64]; 64]),
+            nodes_searched: AtomicU64::new(0),
+            stop_search: AtomicBool::new(false),
+            max_depth: 6,
+            time_limit: None,
+            prev_score: AtomicI32::new(0),
+            learning_module: LearningModule::new(),
+        }
+    }
+
+    pub fn with_time_limit(mut self, millis: u64) -> Self {
+        self.time_limit = Some(Duration::from_millis(millis));
+        self
+    }
+
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
+        self
+    }
+
+    fn should_stop(&self, start_time: Instant) -> bool {
+        if self.stop_search.load(Ordering::Relaxed) {
+            return true;
+        }
+        if let Some(limit) = self.time_limit {
+            if start_time.elapsed() > limit {
+                self.stop_search.store(true, Ordering::Relaxed);
+                return true;
             }
         }
+        false
     }
 
-    let mobility = board.legals().count() as i32;
-    score += mobility * params.mobility_bonus;
-
-    // Invert score for the player whose turn it is
-    if my_color == Color::Black { -score } else { score }
-}
-
-fn get_pst_value(piece: Piece, square: Square, params: &EvalParams) -> i32 {
-    let index = match piece.1 {
-        Color::White => square.to_index(),
-        Color::Black => (7 - square.get_rank().to_index()) * 8 + square.get_file().to_index(),
-    };
-
-    match piece.0 {
-        Piece::Pawn => params.pawn_pst[index],
-        _ => 0, // In a full version, add PSTs for all pieces
+    fn clear_tables(&mut self) {
+        self.tt.clear();
+        self.killer_moves = Box::new([[None; 2]; 64]);
+        self.history = Box::new([[0; 64]; 64]);
+        self.prev_score.store(0, Ordering::Relaxed);
     }
-}
 
-// --- Engine Search Logic ---
+    //- Enhanced Evaluation Function with Tunable Parameters -
+    fn evaluate(&self, board: &Board) -> i32 {
+        if board.status() != chess::BoardStatus::Ongoing {
+            match board.status() {
+                chess::BoardStatus::Checkmate => return -MATE_VALUE,
+                chess::BoardStatus::Stalemate => return 0,
+                chess::BoardStatus::Ongoing => unreachable!(),
+            }
+        }
 
-/// The main engine structure. This is "The Parent" in PCSMC.
-/// It holds the stable, proven evaluation parameters.
-pub struct Musoken {
-    pub eval_params: Arc<Mutex<EvalParams>>,
-}
-
-impl Musoken {
-    pub fn find_best_move(&self, board: &Board, depth: i32) -> Option<ChessMove> {
         let params = self.eval_params.lock().unwrap();
-        let legal_moves = MoveGen::new_legal(board);
+        let mut score = 0;
+        let piece_count = board.combined().popcnt();
 
-        // Use Rayon for parallel root move search (a form of YBWC)
-        let best_move = legal_moves
-            .into_iter()
-            .par_bridge() // Bridge the iterator to be parallel
-            .map(|m| {
-                let mut new_board = board.clone();
-                board.make_move(m, &mut new_board);
-                let score = -search(&new_board, depth - 1, -MATE_SCORE, MATE_SCORE, &params);
-                (m, score)
-            })
-            .max_by_key(|&(_, score)| score);
+        // Material and PST evaluation
+        for square in ALL_SQUARES {
+            if let Some(piece) = board.piece_on(square) {
+                let piece_type = piece.type_of() as usize;
+                let piece_value = params.piece_values[piece_type];
+                let pst_index = square.to_index();
+                let pst_value = match piece.type_of() {
+                    chess::PieceType::Pawn => params.pawn_pst[pst_index],
+                    chess::PieceType::Knight => params.knight_pst[pst_index],
+                    chess::PieceType::Bishop => params.bishop_pst[pst_index],
+                    chess::PieceType::Rook => params.rook_pst[pst_index],
+                    chess::PieceType::Queen => params.queen_pst[pst_index],
+                    chess::PieceType::King => {
+                        if piece_count > 10 { // Middle game
+                            params.king_middle_pst[pst_index]
+                        } else { // Endgame
+                            params.king_end_pst[pst_index]
+                        }
+                    }
+                };
 
-        best_move.map(|(m, _)| m)
-    }
-}
-
-/// A simple alpha-beta search function (negamax style).
-fn search(board: &Board, depth: i32, mut alpha: i32, beta: i32, params: &EvalParams) -> i32 {
-    if depth == 0 {
-        return evaluate(board, params);
-    }
-
-    let mut move_gen = MoveGen::new_legal(board);
-    if move_gen.is_empty() {
-        return if board.checkers().is_empty() { 0 } else { -MATE_SCORE + (100 - depth) }; // Mate in X
-    }
-
-    for m in &mut move_gen {
-        let mut new_board = board.clone();
-        board.make_move(m, &mut new_board);
-        let score = -search(&new_board, depth - 1, -beta, -alpha, params);
-        if score >= beta {
-            return beta; // Fail-hard beta cutoff
+                if piece.color() == board.side_to_move() {
+                    score += piece_value + pst_value;
+                } else {
+                    score -= piece_value + pst_value;
+                }
+            }
         }
-        if score > alpha {
-            alpha = score;
-        }
-    }
-    alpha
-}
 
-// --- Genetic Algorithm for Self-Evolution (PCSMC) ---
+        // Mobility bonus
+        let mobility_bonus = params.mobility_bonus;
+        let white_mobility = MoveGen::new_legal(board).filter(|m| board.side_to_move() == Color::White).count() as i32;
+        let black_mobility = MoveGen::new_legal(board).filter(|m| board.side_to_move() == Color::Black).count() as i32;
+        score += (white_mobility - black_mobility) * mobility_bonus;
 
-/// A "Child" in the PCSMC. It holds a candidate genome and its fitness score.
-#[derive(Clone, Debug)]
-pub struct GAIndividual {
-    pub params: EvalParams,
-    pub fitness: f64,
-}
-
-/// Main function to run the evolutionary process. This is the heart of the vision.
-pub fn run_evolution() -> EvalParams {
-    let mut rng = thread_rng();
-    println!("Musōken: Starting genetic evolution...");
-
-    let mut population: Vec<GAIndividual> = (0..POPULATION_SIZE)
-        .map(|_| GAIndividual {
-            params: mutate(EvalParams::default(), &mut rng),
-            fitness: 0.0,
-        })
-        .collect();
-
-    for gen in 0..GENERATIONS {
-        println!("> Evolving Generation {}/{}...", gen + 1, GENERATIONS);
-
-        // Evaluate Fitness in Parallel (THE SANDBOX)
-        population.par_iter_mut().for_each(|ind| {
-            ind.fitness = calculate_fitness(&ind.params);
-        });
-
-        population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
-        println!("  > Best Fitness in Gen {}: {:.2}", gen + 1, population[0].fitness);
-
-        // Create New Generation
-        let mut new_population = Vec::with_capacity(POPULATION_SIZE);
-        let elite_count = POPULATION_SIZE / 10;
-        new_population.extend_from_slice(&population[..elite_count]);
-
-        while new_population.len() < POPULATION_SIZE {
-            let parent1 = tournament_selection(&population, &mut rng);
-            let parent2 = tournament_selection(&population, &mut rng);
-            let mut child_params = crossover(parent1, parent2, &mut rng);
-            child_params = mutate(child_params, &mut rng);
-            new_population.push(GAIndividual { params: child_params, fitness: 0.0 });
-        }
-        population = new_population;
-    }
-
-    println!("Evolution complete. Best parameters found.");
-    population[0].params.clone()
-}
-
-/// Simulates games to determine the fitness of a given set of evaluation parameters.
-fn calculate_fitness(params: &EvalParams) -> f64 {
-    let mut score = 0.0;
-    let opponent_params = EvalParams::default(); // Test against the baseline
-    let num_games = 4;
-
-    for i in 0..num_games {
-        let mut game = Game::new();
-        let white_is_child = i % 2 == 0;
-
-        while game.result().is_none() {
-            let board = game.current_position();
-            let current_params = if (board.side_to_move() == Color::White && white_is_child) ||
-                                  (board.side_to_move() == Color::Black && !white_is_child) {
-                params
+        // Simple king safety (simplified from Shinigami)
+        let king_safety_bonus = params.king_safety_bonus;
+        // Count attackers near the king
+        if let Some(king_square) = (0..64).find(|&i| {
+            if let Some(piece) = board.piece_on(Square::new(i).unwrap()) {
+                piece.type_of() == chess::PieceType::King && piece.color() == board.side_to_move()
             } else {
-                &opponent_params
+                false
+            }
+        }) {
+            let king_sq = Square::new(king_square as u8).unwrap();
+            let attackers = board.attackers(!board.side_to_move(), king_sq);
+            score -= attackers.popcnt() as i32 * king_safety_bonus;
+        }
+
+        score
+    }
+
+    //- Static Exchange Evaluation -
+    fn see(board: &Board, mv: ChessMove) -> i32 {
+        let target_square = mv.get_dest();
+        let mut gain = Vec::new();
+        
+        if let Some(target_piece) = board.piece_on(target_square) {
+            gain.push(DEFAULT_PIECE_VALUES[target_piece.type_of() as usize]);
+        } else {
+            gain.push(0);
+        }
+
+        let mut board_copy = *board;
+        board_copy = board_copy.make_move_new(mv);
+        
+        let mut turn = !board.side_to_move();
+        let mut attackers = board_copy.attackers(turn, target_square);
+
+        while !attackers.is_empty() {
+            let mut min_attacker_value = i32::MAX;
+            let mut min_attacker_square = None;
+
+            for sq in attackers {
+                if let Some(piece) = board_copy.piece_on(sq) {
+                    let value = DEFAULT_PIECE_VALUES[piece.type_of() as usize];
+                    if value < min_attacker_value {
+                        min_attacker_value = value;
+                        min_attacker_square = Some(sq);
+                    }
+                }
+            }
+
+            if let Some(sq) = min_attacker_square {
+                let attacker_piece = board_copy.piece_on(sq).unwrap();
+                gain.push(DEFAULT_PIECE_VALUES[attacker_piece.type_of() as usize]);
+                
+                let recapture_mv = ChessMove::new(sq, target_square, None);
+                board_copy = board_copy.make_move_new(recapture_mv);
+                attackers = board_copy.attackers(!turn, target_square);
+                turn = !turn;
+            } else {
+                break;
+            }
+        }
+
+        let mut value = 0;
+        for &g in gain.iter().rev() {
+            value = g - value.max(0);
+        }
+        value
+    }
+
+    //- Move Ordering Score -
+    fn score_move(&self, board: &Board, mv: ChessMove, ply: usize) -> i32 {
+        let mut score = 0;
+        
+        // Captures (MVV-LVA + SEE)
+        if board.piece_on(mv.get_dest()).is_some() {
+            let victim_value = board.piece_on(mv.get_dest())
+                .map(|p| DEFAULT_PIECE_VALUES[p.type_of() as usize])
+                .unwrap_or(0);
+            let attacker_value = board.piece_on(mv.get_source())
+                .map(|p| DEFAULT_PIECE_VALUES[p.type_of() as usize])
+                .unwrap_or(0);
+            let see_value = Self::see(board, mv);
+            
+            if see_value >= 0 {
+                score += 1_000_000 + victim_value - attacker_value;
+            } else {
+                score += 500_000 + victim_value - attacker_value; // Still prefer captures, but lower
+            }
+        }
+        
+        // Killer moves
+        if self.killer_moves[ply][0] == Some(mv) {
+            score += 900_000;
+        } else if self.killer_moves[ply][1] == Some(mv) {
+            score += 800_000;
+        }
+        
+        // History heuristic
+        score += self.history[mv.get_source().to_index()][mv.get_dest().to_index()];
+        
+        // Promotions
+        if let Some(promotion_piece) = mv.get_promotion() {
+            score += DEFAULT_PIECE_VALUES[promotion_piece as usize] + 50_000;
+        }
+        
+        score
+    }
+
+    //- Quiescence Search -
+    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32) -> i32 {
+        self.nodes_searched.fetch_add(1, Ordering::Relaxed);
+        
+        let stand_pat = self.evaluate(board);
+        
+        if stand_pat >= beta {
+            return beta;
+        }
+        
+        if alpha < stand_pat {
+            alpha = stand_pat;
+        }
+        
+        // Generate only captures and check evasions
+        let mut captures: Vec<(ChessMove, i32)> = MoveGen::new_legal(board)
+            .filter(|mv| board.piece_on(mv.get_dest()).is_some())
+            .map(|mv| {
+                let victim_value = board.piece_on(mv.get_dest())
+                    .map(|p| DEFAULT_PIECE_VALUES[p.type_of() as usize])
+                    .unwrap_or(0);
+                let attacker_value = board.piece_on(mv.get_source())
+                    .map(|p| DEFAULT_PIECE_VALUES[p.type_of() as usize])
+                    .unwrap_or(0);
+                (mv, victim_value - attacker_value + 100_000)
+            })
+            .collect();
+            
+        captures.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        for (mv, _) in captures {
+            let new_board = board.make_move_new(mv);
+            let score = -self.quiescence(&new_board, -beta, -alpha);
+            
+            if score >= beta {
+                return beta;
+            }
+            
+            if score > alpha {
+                alpha = score;
+            }
+        }
+        
+        alpha
+    }
+
+    //- Principal Variation Search -
+    fn pvs(&mut self, board: &Board, depth: i32, alpha: i32, beta: i32, ply: usize, is_pv: bool) -> i32 {
+        self.nodes_searched.fetch_add(1, Ordering::Relaxed);
+        
+        if self.should_stop(Instant::now()) {
+            return 0;
+        }
+        
+        // Check for game end
+        match board.status() {
+            chess::BoardStatus::Checkmate => return -MATE_VALUE + ply as i32,
+            chess::BoardStatus::Stalemate => return 0,
+            chess::BoardStatus::Ongoing => {}
+        }
+        
+        // Transposition Table Probe
+        let hash = board.get_hash();
+        // Simplified TT lookup for this example
+        
+        // Quiescence search at leaf nodes
+        if depth <= 0 {
+            return self.quiescence(board, alpha, beta);
+        }
+        
+        let is_in_check = board.checkers().popcnt() > 0;
+        let mut legal_moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+        
+        if legal_moves.is_empty() {
+            if is_in_check {
+                return -MATE_VALUE + ply as i32;
+            } else {
+                return 0; // Stalemate
+            }
+        }
+        
+        // Move Ordering
+        let mut scored_moves: Vec<(ChessMove, i32)> = legal_moves
+            .into_iter()
+            .map(|mv| (mv, self.score_move(board, mv, ply)))
+            .collect();
+        scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        let mut best_score = -INFINITY;
+        let mut best_move = None;
+        let mut move_count = 0;
+        
+        // Null Move Pruning
+        if !is_pv && !is_in_check && depth >= 3 {
+            // Simple null move pruning condition
+            if self.evaluate(board) >= beta {
+                let r = (3 + depth / 4).min(depth);
+                // Note: chess crate doesn't have null_move(), this is conceptual
+                // let null_board = board.null_move().unwrap();
+                // let null_score = -self.pvs(&null_board, depth - r - 1, -beta, -beta + 1, ply + 1, false);
+                // if null_score >= beta {
+                //     return beta;
+                // }
+            }
+        }
+        
+        // Loop through moves
+        for (mv, _) in scored_moves {
+            move_count += 1;
+            let new_board = board.make_move_new(mv);
+            
+            let mut score;
+            if move_count == 1 {
+                // First move 
+                score = -self.pvs(&new_board, depth - 1, -beta, -alpha, ply + 1, is_pv);
+            } else {
+                // Late Move Reductions
+                let mut r = 0;
+                if !is_pv && !is_in_check && move_count > 3 && depth >= 3 {
+                    r = 1; // Simple LMR
+                }
+                
+                // Null Window Search
+                let new_depth = (depth - 1 - r).max(0);
+                score = -self.pvs(&new_board, new_depth, -alpha - 1, -alpha, ply + 1, false);
+                
+                // Re-search if necessary
+                if score > alpha && score < beta {
+                    score = -self.pvs(&new_board, depth - 1, -beta, -alpha, ply + 1, is_pv);
+                }
+            }
+            
+            if score > best_score {
+                best_score = score;
+                best_move = Some(mv);
+                
+                if score > alpha {
+                    alpha = score;
+                }
+                
+                if score >= beta {
+                    // Beta cutoff
+                    // Store killer move
+                    if board.piece_on(mv.get_dest()).is_none() {
+                        self.killer_moves[ply][1] = self.killer_moves[ply][0];
+                        self.killer_moves[ply][0] = Some(mv);
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // Update history heuristic
+        if let Some(bm) = best_move {
+            if board.piece_on(bm.get_dest()).is_none() { // Non-capture
+                let delta = (depth * depth) as i32;
+                let from = bm.get_source().to_index();
+                let to = bm.get_dest().to_index();
+                self.history[from][to] = (self.history[from][to] + delta).min(10000);
+            }
+        }
+        
+        best_score
+    }
+
+    //- Iterative Deepening with Aspiration Windows -
+    pub fn find_best_move(&mut self, board: &Board) -> Option<ChessMove> {
+        self.nodes_searched.store(0, Ordering::Relaxed);
+        self.stop_search.store(false, Ordering::Relaxed);
+        self.tt.clear();
+        self.prev_score.store(0, Ordering::Relaxed);
+        
+        let start_time = Instant::now();
+        let mut best_move = None;
+        let mut prev_best_score = 0;
+        
+        // Iterative Deepening
+        for depth in 1..=self.max_depth {
+            if self.should_stop(start_time) {
+                break;
+            }
+            
+            // Aspiration Windows
+            let mut alpha = prev_best_score - 50;
+            let mut beta = prev_best_score + 50;
+            let mut research_count = 0;
+            
+            loop {
+                let score = self.pvs(board, depth as i32, alpha, beta, 0, true);
+                
+                if self.should_stop(start_time) {
+                    break;
+                }
+                
+                if score <= alpha {
+                    alpha = (alpha - 500).max(-INFINITY);
+                    research_count += 1;
+                } else if score >= beta {
+                    beta = (beta + 500).min(INFINITY);
+                    research_count += 1;
+                } else {
+                    // Success
+                    prev_best_score = score;
+                    
+                    // In a full implementation, we'd extract the best move from the PV.
+                    // For now, we'll just take the first legal move as a placeholder.
+                    if let Some(mv) = MoveGen::new_legal(board).next() {
+                        best_move = Some(mv);
+                    }
+                    break;
+                }
+                
+                if research_count > 4 {
+                    // Too many researches, search full window
+                    alpha = -INFINITY;
+                    beta = INFINITY;
+                }
+            }
+        }
+        
+        println!("Musōken searched {} nodes", self.nodes_searched.load(Ordering::Relaxed));
+        best_move
+    }
+
+    //- Genetic Algorithm for Feature Tuning -
+    pub fn run_genetic_algorithm(&mut self) {
+        println!("Musōken starting genetic algorithm tuning...");
+        let mut rng = thread_rng();
+        let mut population: Vec<GAIndividual> = Vec::with_capacity(POPULATION_SIZE);
+        
+        // Initialize population
+        for _ in 0..POPULATION_SIZE {
+            population.push(GAIndividual::random(&mut rng));
+        }
+        
+        for generation in 0..GENERATIONS {
+            println!("Generation {}/{}", generation + 1, GENERATIONS);
+            
+            // Evaluate fitness (simplified - in reality, this would involve playing games)
+            population.par_iter_mut().for_each(|ind| {
+                // This is a placeholder fitness function
+                // A real implementation would play games with these parameters
+                // and evaluate based on win rate
+                ind.fitness = 1000.0 - (ind.params.piece_values[1] as f64 - 100.0).abs(); // Prefer pawn value close to 100
+            });
+            
+            // Sort by fitness (descending)
+            population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+            
+            // Print best individual
+            println!("Best fitness: {:.2}", population[0].fitness);
+            
+            // Create new population
+            let mut new_population = Vec::with_capacity(POPULATION_SIZE);
+            
+            // Elitism: keep best 10%
+            let elite_count = POPULATION_SIZE / 10;
+            for i in 0..elite_count {
+                new_population.push(population[i].clone());
+            }
+            
+            // Fill rest with offspring
+            while new_population.len() < POPULATION_SIZE {
+                let parent1 = self.tournament_selection(&population, &mut rng);
+                let parent2 = self.tournament_selection(&population, &mut rng);
+                let child = self.crossover(&parent1, &parent2, &mut rng);
+                let mutated_child = self.mutate(&child, &mut rng);
+                new_population.push(mutated_child);
+            }
+            
+            population = new_population;
+        }
+        
+        // Set the best parameters
+        if let Ok(mut params) = self.eval_params.lock() {
+            *params = population[0].params.clone();
+        }
+        
+        println!("Genetic algorithm completed. updated parameters installed.");
+    }
+    
+    fn tournament_selection(&self, population: &[GAIndividual], rng: &mut ThreadRng) -> GAIndividual {
+        let mut best = &population[rng.gen_range(0..population.len())];
+        for _ in 1..TOURNAMENT_SIZE {
+            let candidate = &population[rng.gen_range(0..population.len())];
+            if candidate.fitness > best.fitness {
+                best = candidate;
+            }
+        }
+        best.clone()
+    }
+    
+    fn crossover(&self, parent1: &GAIndividual, parent2: &GAIndividual, rng: &mut ThreadRng) -> GAIndividual {
+        let mut child_params = parent1.params.clone();
+        
+        // Simple crossover: randomly choose parameters from each parent
+        for i in 1..7 { // Piece values
+            if rng.gen_bool(0.5) {
+                child_params.piece_values[i] = parent2.params.piece_values[i];
+            }
+        }
+        
+        // Crossover PSTs
+        crossover_pst(&mut child_params.pawn_pst, &parent2.params.pawn_pst, rng);
+        crossover_pst(&mut child_params.knight_pst, &parent2.params.knight_pst, rng);
+        crossover_pst(&mut child_params.bishop_pst, &parent2.params.bishop_pst, rng);
+        crossover_pst(&mut child_params.rook_pst, &parent2.params.rook_pst, rng);
+        crossover_pst(&mut child_params.queen_pst, &parent2.params.queen_pst, rng);
+        crossover_pst(&mut child_params.king_middle_pst, &parent2.params.king_middle_pst, rng);
+        crossover_pst(&mut child_params.king_end_pst, &parent2.params.king_end_pst, rng);
+        
+        GAIndividual::new(child_params)
+    }
+    
+    fn mutate(&self, individual: &GAIndividual, rng: &mut ThreadRng) -> GAIndividual {
+        let mut new_ind = individual.clone();
+        mutate_pst(&mut new_ind.params.pawn_pst, rng);
+        mutate_pst(&mut new_ind.params.knight_pst, rng);
+        mutate_pst(&mut new_ind.params.bishop_pst, rng);
+        mutate_pst(&mut new_ind.params.rook_pst, rng);
+        mutate_pst(&mut new_ind.params.queen_pst, rng);
+        mutate_pst(&mut new_ind.params.king_middle_pst, rng);
+        mutate_pst(&mut new_ind.params.king_end_pst, rng);
+        new_ind
+    }
+    
+    //- Self-Play for Learning -
+    pub fn self_play(&mut self, num_games: usize) {
+        println!("Musōken starting self-play for {} games...", num_games);
+        
+        for game_idx in 0..num_games {
+            println!("Playing game {}/{}", game_idx + 1, num_games);
+            let mut board = Board::default();
+            let mut moves = Vec::new();
+            
+            // Play a game
+            while board.status() == chess::BoardStatus::Ongoing {
+                // Use a copy of the engine for this game to avoid interference
+                let mut game_engine = Musoken {
+                    eval_params: Arc::clone(&self.eval_params),
+                    tt: Arc::new(DashMap::new()),
+                    killer_moves: Box::new([[None; 2]; 64]),
+                    history: Box::new([[0; 64]; 64]),
+                    nodes_searched: AtomicU64::new(0),
+                    stop_search: AtomicBool::new(false),
+                    max_depth: 4, // Lower depth for self-play speed
+                    time_limit: Some(Duration::from_millis(1000)),
+                    prev_score: AtomicI32::new(0),
+                    learning_module: LearningModule::new(),
+                };
+                
+                if let Some(mv) = game_engine.find_best_move(&board) {
+                    moves.push(mv.to_string());
+                    board = board.make_move_new(mv);
+                } else {
+                    break;
+                }
+            }
+            
+            // Record game result
+            let result = match board.status() {
+                chess::BoardStatus::Checkmate => {
+                    if board.side_to_move() == Color::White {
+                        "0-1"
+                    } else {
+                        "1-0"
+                    }
+                },
+                _ => "1/2-1/2"
             };
             
-            let best_move = MoveGen::new_legal(&board)
-                .max_by_key(|m| {
-                    let mut b = board.clone();
-                    board.make_move(*m, &mut b);
-                    -search(&b, 2, -MATE_SCORE, MATE_SCORE, current_params) // Shallow search for fitness
-                });
-
-            if let Some(m) = best_move {
-                game.play(&m).unwrap();
-            } else { break; }
+            let game_result = GameResult {
+                moves,
+                result: result.to_string(),
+                fen: Board::default().to_string(),
+            };
+            
+            self.learning_module.add_game(game_result);
         }
+        
+        println!("Self-play completed. {} games recorded.", num_games);
+    }
+    
+    //- Save/Load Learned Parameters -
+    pub fn save_parameters(&self, filename: &str) -> IoResult<()> {
+        let file = File::create(filename)?;
+        let writer = BufWriter::new(file);
+        if let Ok(params) = self.eval_params.lock() {
+            serde_json::to_writer(writer, &*params)?;
+        }
+        Ok(())
+    }
+    
+    pub fn load_parameters(&self, filename: &str) -> IoResult<()> {
+        let file = File::open(filename)?;
+        let reader = BufReader::new(file);
+        let params: EvalParams = serde_json::from_reader(reader)?;
+        if let Ok(mut eval_params) = self.eval_params.lock() {
+            *eval_params = params;
+        }
+        Ok(())
+    }
+}
 
-        if let Some(result) = game.result() {
-            match result {
-                GameResult::WhiteWon if white_is_child => score += 1.0,
-                GameResult::BlackWon if !white_is_child => score += 1.0,
-                GameResult::Draw => score += 0.5,
-                _ => {}
+fn crossover_pst(child: &mut [i32; 64], parent2: &[i32; 64], rng: &mut ThreadRng) {
+    for i in 0..64 {
+        if rng.gen_bool(0.5) {
+            child[i] = parent2[i];
+        }
+    }
+}
+
+//- UCI Protocol Implementation -
+impl Musoken {
+    pub fn uci_loop(&mut self) {
+        let mut board = Board::default();
+        
+        loop {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            let commands: Vec<&str> = input.trim().split_whitespace().collect();
+            
+            match commands.as_slice() {
+                ["uci"] => {
+                    println!("id name: Musoken – The unrivaled blade");
+                    println!("id author: Tonmoy KS");
+                    println!("uciok");
+                }
+                ["isready"] => {
+                    println!("readyok");
+                }
+                ["ucinewgame"] => {
+                    self.clear_tables();
+                }
+                ["position", "startpos"] => {
+                    board = Board::default();
+                }
+                ["position", "startpos", "moves", ..] => {
+                    board = Board::default();
+                    for mv_str in &commands[3..] {
+                        if let Ok(mv) = mv_str.parse() {
+                            board = board.make_move_new(mv);
+                        }
+                    }
+                }
+                ["position", "fen", ..] => {
+                    let fen_parts: Vec<&str> = commands[2..].iter().take_while(|&&s| s != "moves").copied().collect();
+                    let fen = fen_parts.join(" ");
+                    if let Ok(b) = Board::from_fen(fen.as_str()) {
+                        board = b;
+                        // Handle moves if present
+                        if let Some(moves_idx) = commands.iter().position(|&s| s == "moves") {
+                            for mv_str in &commands[moves_idx + 1..] {
+                                if let Ok(mv) = mv_str.parse() {
+                                    board = board.make_move_new(mv);
+                                }
+                            }
+                        }
+                    }
+                }
+                ["go", ..] => {
+                    let mut depth = self.max_depth;
+                    let mut time_limit_ms = 5000; // Default 5 seconds
+                    
+                    let mut i = 1;
+                    while i < commands.len() {
+                        match commands[i] {
+                            "depth" => {
+                                if i + 1 < commands.len() {
+                                    depth = commands[i + 1].parse().unwrap_or(depth);
+                                    i += 1;
+                                }
+                            }
+                            "movetime" => {
+                                if i + 1 < commands.len() {
+                                    time_limit_ms = commands[i + 1].parse().unwrap_or(time_limit_ms);
+                                    i += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    
+                    let mut engine_clone = Musoken {
+                        eval_params: Arc::clone(&self.eval_params),
+                        tt: Arc::clone(&self.tt),
+                        killer_moves: self.killer_moves.clone(),
+                        history: self.history.clone(),
+                        nodes_searched: AtomicU64::new(0),
+                        stop_search: AtomicBool::new(false),
+                        max_depth: depth,
+                        time_limit: Some(Duration::from_millis(time_limit_ms)),
+                        prev_score: AtomicI32::new(self.prev_score.load(Ordering::Relaxed)),
+                        learning_module: self.learning_module.clone(),
+                    };
+                    
+                    if let Some(best_move) = engine_clone.find_best_move(&board) {
+                        println!("bestmove {}", best_move);
+                    } else {
+                        println!("bestmove (none)");
+                    }
+                }
+                ["stop"] => {
+                    self.stop_search.store(true, Ordering::Relaxed);
+                }
+                ["quit"] => break,
+                // Custom commands for Musoken
+                ["tune"] => {
+                    self.run_genetic_algorithm();
+                }
+                ["selfplay", num_str] => {
+                    if let Ok(num_games) = num_str.parse::<usize>() {
+                        self.self_play(num_games);
+                    }
+                }
+                ["saveparams", filename] => {
+                    if let Err(e) = self.save_parameters(filename) {
+                        println!("Failed to save parameters: {}", e);
+                    } else {
+                        println!("Parameters saved to {}", filename);
+                    }
+                }
+                ["loadparams", filename] => {
+                    if let Err(e) = self.load_parameters(filename) {
+                        println!("Failed to load parameters: {}", e);
+                    } else {
+                        println!("Parameters loaded from {}", filename);
+                    }
+                }
+                _ => {} // Ignore unknown commands
             }
         }
     }
-    score
 }
 
-fn tournament_selection<'a>(population: &'a [GAIndividual], rng: &mut ThreadRng) -> &'a EvalParams {
-    population.choose_multiple(rng, TOURNAMENT_SIZE)
-        .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
-        .map(|ind| &ind.params)
-        .unwrap()
-}
-
-fn crossover(parent1: &EvalParams, parent2: &EvalParams, rng: &mut ThreadRng) -> EvalParams {
-    let mut child = parent1.clone();
-    for i in 1..7 { if rng.gen_bool(0.5) { child.piece_values[i] = parent2.piece_values[i]; } }
-    for i in 0..64 { if rng.gen_bool(0.5) { child.pawn_pst[i] = parent2.pawn_pst[i]; } }
-    child
-}
-
-fn mutate(mut params: EvalParams, rng: &mut ThreadRng) -> EvalParams {
-    for i in 1..7 { if rng.gen_bool(MUTATION_RATE) { params.piece_values[i] += rng.gen_range(-20..=20); } }
-    for i in 0..64 { if rng.gen_bool(MUTATION_RATE) { params.pawn_pst[i] += rng.gen_range(-10..=10); } }
-    params
-}
-
-// --- Main Application Logic (UCI Loop) ---
-
-fn main() {
-    println!("Musōken Chess Engine - Bedrock V.0.1 (Single File Edition)");
-    let eval_params = Arc::new(Mutex::new(EvalParams::default()));
-
-    let mut line = String::new();
-    loop {
-        io::stdin().read_line(&mut line).unwrap();
-        let commands: Vec<&str> = line.trim().split_whitespace().collect();
-
-        match commands.get(0) {
-            Some(&"uci") => {
-                println!("id name Musoken 0.1");
-                println!("id author Tonmoy-KS");
-                println!("uciok");
-            }
-            Some(&"isready") => println!("readyok"),
-            Some(&"ucinewgame") => { /* In a real engine, clear hash tables here */ }
-            Some(&"position") => { /* Placeholder for position setup */ }
-            Some(&"go") => {
-                let board = chess::Board::default(); // For demonstration
-                let engine = Musoken { eval_params: Arc::clone(&eval_params) };
-                thread::spawn(move || {
-                    if let Some(best_move) = engine.find_best_move(&board, 4) {
-                        println!("bestmove {}", best_move);
-                    }
-                });
-            }
-            Some(&"tune") => {
-                println!("Starting self-evolution... Musōken is entering the void.");
-                let best_params = run_evolution();
-                println!("Evolution complete. Musōken has returned with new insight.");
-                // Atomically update the main engine's parameters
-                let mut guard = eval_params.lock().unwrap();
-                *guard = best_params;
-                println!("New parameters installed.");
-            }
-            Some(&"quit") => break,
-            _ => {}
+// Implement Clone for LearningModule
+impl Clone for LearningModule {
+    fn clone(&self) -> Self {
+        LearningModule {
+            game_db: Arc::clone(&self.game_db),
+            opening_book: Arc::clone(&self.opening_book),
+            eval_training_data: Arc::clone(&self.eval_training_data),
         }
-        line.clear();
+    }
+}
+
+//- Entry Point -
+fn main() {
+    let mut engine = Musoken::new()
+        .with_depth(8) // Increased default depth
+        .with_time_limit(5000); // 5 seconds default
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && &args[1] == "uci" {
+        engine.uci_loop();
+    } else {
+        let board = Board::default();
+        println!("Musōken analyzing initial position...");
+        if let Some(best_move) = engine.find_best_move(&board) {
+            println!("Musōken plays: {}", best_move);
+        } else {
+            println!("Musōken found no move.");
+        }
     }
 }
