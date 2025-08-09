@@ -118,4 +118,4 @@ GitHub: [Tonmoy-KS](https://github.com/Tonmoy-KS)
 
 ---
 
-[PUP](Https://GitHub.com/Tonmoy-KS/Musoken-Chess-Engine/PUP)
+[PUP](https://github.com/Tonmoy-KS/Musoken-Chess-Engine/PUP)
