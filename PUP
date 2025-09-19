@@ -34,19 +34,18 @@ Here's a better explanation:
 Here's a good thing about Rust: the evolution needs a robust "sandbox" to run the evolved code. The engine must be able to test its new, self-written logic without crashing the entire system if the new code has an infinite loop or a division-by-zero error. Rust's safety guarantees provide a massive head start here.
 
 
-Here's a conceptual technique I made, I'd like to call it PCSMC(Parent-Child-Sandbox-Mutation-Concept):
+Here's a conceptual technique I made, I'd like to call it CLEMC(Contained-logic-evolving-mutation-concept):
     1.  Have the main Musōken engine (`The Parent`) run its stable, proven code.
     2.  Use genetic programming to create a new, mutated version of an evaluation function (`The Child`).
     3.  Spawn this `Child` function in a separate, controlled thread or process.
     4.  **Crucially, Rust's safety guarantees ensure that if the `Child` code crashes, it will panic and die within its own thread without corrupting the memory or state of the `Parent`.**
     5.  The `Parent` can then safely observe that the `Child` failed, assign it a fitness score of zero, and move on to testing the next mutation.
 
-PCSMC is like YBWC but for self-evolving instead of faster tree search. 
 
 
 --------------------------------
 
-# now, I need to make a bedrock version of the concept. 
+now, I need to make a bedrock version of the concept. 
 
 ### `Cargo.toml`
 
